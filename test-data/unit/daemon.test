@@ -802,3 +802,238 @@ Found 1 error in 1 file (checked 1 source file)
 [file test.py]
 from xml.etree.ElementTree import Element
 1 + 'a'
+
+[case testDaemonExplainReverseCausalQuery]
+[file models.py]
+class User:
+    rate: float
+[file billing.py]
+from models import User
+def calc(u: User) -> float:
+    return u.rate * 2.0
+[file other.py]
+def ping() -> int:
+    return 1
+[file models.py.2]
+from decimal import Decimal
+class User:
+    rate: Decimal
+[out]
+$ dmypy start -- --hide-error-codes
+Daemon started
+$ dmypy check models.py billing.py other.py
+Success: no issues found in 3 source files
+$ cp models.py.2 models.py
+$ dmypy recheck --explain-target billing.calc
+billing.py:3: error: Unsupported operand types for * ("Decimal" and "int")
+Found 1 error in 1 file (checked 1 source file)
+
+Update #2 — Filtered for: billing.calc (3 targets in chain, 0 ms)
+
+Root change: models.py (file_modified) [models]
+└─ [symbol_changed] models.User.rate (models.py:3)
+   Reason: type changed (builtins.float -> decimal.Decimal)
+   └─ Trigger <models.User.rate>
+      └─ [trigger_fired] billing.calc (billing.py:3)
+         └─ (signature unchanged; propagation stopped)
+== Return code: 1
+$ dmypy explain --target billing.calc --reverse
+Update #2 — Reverse causal query for: billing.calc
+
+Target: billing.calc (billing.py:3)
+  ▲ caused by [trigger_fired] via <models.User.rate>
+  [upstream] models.User.rate (models.py:3)
+  │ [symbol_changed] type changed (builtins.float -> decimal.Decimal)
+  ▲ caused by [symbol_changed] via <models.User.rate>
+  [upstream] models (models.py:1)
+  │ [file_modified] Source file modified on disk
+$ dmypy explain --target other.ping --reverse
+Update #2 — Reverse causal query for: other.ping
+
+Target 'other.ping' was not rechecked in Update #2 (cached analysis reused).
+$ dmypy stop
+Daemon stopped
+
+[case testDaemonExplainMroAndBodyOnlyEdit]
+-- Test that MRO changes propagate to callers while body-only edits stop locally.
+[file domain.py]
+class BaseA:
+    def tag(self) -> str:
+        return "a"
+
+class BaseB:
+    def tag(self) -> int:
+        return 1
+
+class Child(BaseA):
+    pass
+
+def helper(x: int) -> int:
+    return x + 1
+[file app.py]
+from domain import Child, helper
+
+def render_tag(c: Child) -> str:
+    return c.tag().upper()
+
+def compute(v: int) -> int:
+    return helper(v)
+[file domain.py.2]
+class BaseA:
+    def tag(self) -> str:
+        return "a"
+
+class BaseB:
+    def tag(self) -> int:
+        return 1
+
+class Child(BaseB):
+    pass
+
+def helper(x: int) -> int:
+    y = x * 2
+    return y + 1
+[out]
+$ dmypy start -- --follow-imports=error --hide-error-codes
+Daemon started
+$ dmypy check domain.py app.py
+Success: no issues found in 2 source files
+$ cp domain.py.2 domain.py
+$ dmypy recheck --explain
+app.py:4: error: "int" has no attribute "upper"
+Found 1 error in 1 file (checked 2 source files)
+
+Update #2: 1 file(s) changed, 4 target(s) rechecked (0 ms)
+
+Root change: domain.py (file_modified) [domain]
+├─ [mro_changed] domain.Child (domain.py:9)
+│  Reason: class MRO changed (['domain.Child', 'domain.BaseA', 'builtins.object'] -> ['domain.Child', 'domain.BaseB', 'builtins.object'])
+│  └─ Trigger <domain.Child>
+│     └─ [trigger_fired] app.render_tag (app.py:3)
+│        └─ (signature unchanged; propagation stopped)
+└─ [body_changed] domain.helper (domain.py:12)
+   Reason: function body modified (signature unchanged)
+   └─ (signature unchanged; propagation stopped)
+== Return code: 1
+$ dmypy explain --target app.compute
+Update #2 — Target 'app.compute' was not rechecked (cached analysis reused).
+$ dmypy stop
+Daemon stopped
+
+[case testDaemonExplainMultiHopInferredChain]
+-- Test 2-hop deferred reprocessing when an inferred module variable changes type.
+[file a.py]
+VAL = 10
+[file b.py]
+from a import VAL
+DERIVED = VAL
+[file c.py]
+from b import DERIVED
+
+def use_derived() -> int:
+    return DERIVED + 1
+[file a.py.2]
+VAL = "ten"
+[out]
+$ dmypy start -- --follow-imports=error --hide-error-codes
+Daemon started
+$ dmypy check a.py b.py c.py
+Success: no issues found in 3 source files
+$ cp a.py.2 a.py
+$ dmypy recheck --explain-target c.use_derived
+c.py:4: error: Unsupported operand types for + ("str" and "int")
+Found 1 error in 1 file (checked 3 source files)
+
+Update #2 — Filtered for: c.use_derived (4 targets in chain, 0 ms)
+
+Root change: a.py (file_modified) [a]
+└─ [symbol_changed] a.VAL (a.py:1)
+   Reason: type changed (builtins.int -> builtins.str)
+   └─ Trigger <a.VAL>
+      └─ [trigger_fired] b.DERIVED (b.py:2)
+         └─ [symbol_changed] type changed (builtins.int -> builtins.str)
+         └─ Trigger <b.DERIVED>
+            └─ [trigger_fired] c.use_derived (c.py:3)
+               └─ (signature unchanged; propagation stopped)
+== Return code: 1
+$ dmypy explain --target c.use_derived --reverse
+Update #2 — Reverse causal query for: c.use_derived
+
+Target: c.use_derived (c.py:3)
+  ▲ caused by [trigger_fired] via <b.DERIVED>
+  [upstream] b.DERIVED (b.py:2)
+  │ [symbol_changed] type changed (builtins.int -> builtins.str)
+  ▲ caused by [trigger_fired] via <a.VAL>
+  [upstream] a.VAL (a.py:1)
+  │ [symbol_changed] type changed (builtins.int -> builtins.str)
+  ▲ caused by [symbol_changed] via <a.VAL>
+  [upstream] a (a.py:1)
+  │ [file_modified] Source file modified on disk
+$ dmypy stop
+Daemon stopped
+
+[case testDaemonExplainFileDeleted]
+-- Test that deleting an imported file records file_deleted provenance cleanly.
+[file lib.py]
+CONST: int = 1
+[file main.py]
+from lib import CONST
+
+def f() -> int:
+    return CONST
+[out]
+$ dmypy start -- --follow-imports=error
+Daemon started
+$ dmypy check lib.py main.py
+Success: no issues found in 2 source files
+$ rm lib.py
+$ dmypy recheck --explain --remove lib.py
+main.py:1: error: Cannot find implementation or library stub for module named "lib"  [import-not-found]
+main.py:1: note: See https://mypy.readthedocs.io/en/stable/running_mypy.html#missing-imports
+Found 1 error in 1 file (checked 1 source file)
+
+Update #2: 1 file(s) changed, 2 target(s) rechecked (0 ms)
+
+Root change: lib.py (file_deleted) [lib]
+└─ Trigger <lib>
+   └─ [trigger_fired] main.f (main.py:3)
+      └─ (signature unchanged; propagation stopped)
+== Return code: 1
+$ dmypy stop
+Daemon stopped
+
+[case testDaemonExplainPreservedAcrossNoOpRecheck]
+-- Test that a subsequent no-op recheck does not wipe out last_explanation.
+[file m.py]
+X: int = 1
+[file u.py]
+from m import X
+def g() -> int:
+    return X
+[file m.py.2]
+X: str = "one"
+[out]
+$ dmypy start -- --follow-imports=error --hide-error-codes
+Daemon started
+$ dmypy check m.py u.py
+Success: no issues found in 2 source files
+$ cp m.py.2 m.py
+$ dmypy recheck
+u.py:3: error: Incompatible return value type (got "str", expected "int")
+Found 1 error in 1 file (checked 2 source files)
+== Return code: 1
+$ dmypy recheck
+u.py:3: error: Incompatible return value type (got "str", expected "int")
+Found 1 error in 1 file (checked 2 source files)
+== Return code: 1
+$ dmypy explain --target u.g
+Update #2 — Filtered for: u.g (3 targets in chain, 0 ms)
+
+Root change: m.py (file_modified) [m]
+└─ [symbol_changed] m.X (m.py:1)
+   Reason: type changed (builtins.int -> builtins.str)
+   └─ Trigger <m.X>
+      └─ [trigger_fired] u.g (u.py:2)
+         └─ (signature unchanged; propagation stopped)
+$ dmypy stop
+Daemon stopped

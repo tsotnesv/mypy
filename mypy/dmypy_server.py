@@ -32,6 +32,7 @@ from mypy.inspections import InspectionEngine
 from mypy.ipc import IPCServer
 from mypy.modulefinder import BuildSource, FindModuleCache, SearchPaths, compute_search_paths
 from mypy.options import Options
+from mypy.server.explain import UpdateExplanation, filter_explanation_for_target
 from mypy.server.update import FineGrainedBuildManager, refresh_suppressed_submodules
 from mypy.suggestions import SuggestionEngine, SuggestionFailure
 from mypy.typestate import reset_global_state
@@ -180,6 +181,7 @@ class Server:
         self.options_snapshot = options.snapshot()
         self.timeout = timeout
         self.fine_grained_manager: FineGrainedBuildManager | None = None
+        self.last_explanation: UpdateExplanation | None = None
 
         if os.path.isfile(status_file):
             os.unlink(status_file)
@@ -359,15 +361,41 @@ class Server:
             return {"out": stdout.getvalue(), "err": stderr.getvalue(), "status": e.code}
         return self.check(sources, export_types, is_tty, terminal_width)
 
+    def _get_explanation_dict(
+        self, target: str | None = None
+    ) -> dict[str, Any] | None:
+        if (
+            self.fine_grained_manager is not None
+            and self.fine_grained_manager.last_explanation is not None
+        ):
+            self.last_explanation = self.fine_grained_manager.last_explanation
+        if self.last_explanation is None:
+            return None
+        explanation = self.last_explanation
+        if target is not None:
+            explanation = filter_explanation_for_target(explanation, target)
+        return explanation.to_dict()
+
     def cmd_check(
-        self, files: Sequence[str], export_types: bool, is_tty: bool, terminal_width: int
+        self,
+        files: Sequence[str],
+        export_types: bool,
+        is_tty: bool,
+        terminal_width: int,
+        explain: bool = False,
+        explain_target: str | None = None,
     ) -> dict[str, object]:
         """Check a list of files."""
         try:
             sources = create_source_list(files, self.options, self.fscache)
         except InvalidSourceList as err:
             return {"out": "", "err": str(err), "status": 2}
-        return self.check(sources, export_types, is_tty, terminal_width)
+        res = self.check(sources, export_types, is_tty, terminal_width)
+        if explain or explain_target is not None:
+            exp_dict = self._get_explanation_dict(explain_target)
+            if exp_dict is not None:
+                res["explanation"] = exp_dict
+        return res
 
     def cmd_recheck(
         self,
@@ -376,6 +404,8 @@ class Server:
         export_types: bool,
         remove: list[str] | None = None,
         update: list[str] | None = None,
+        explain: bool = False,
+        explain_target: str | None = None,
     ) -> dict[str, object]:
         """Check the same list of files we checked most recently.
 
@@ -418,7 +448,18 @@ class Server:
         self.flush_caches()
         self.update_stats(res)
         self.options.export_types = old_export_types
+        if explain or explain_target is not None:
+            exp_dict = self._get_explanation_dict(explain_target)
+            if exp_dict is not None:
+                res["explanation"] = exp_dict
         return res
+
+    def cmd_explain(self, target: str | None = None) -> dict[str, object]:
+        """Return the invalidation explanation from the most recent update."""
+        exp_dict = self._get_explanation_dict(target)
+        if exp_dict is None:
+            return {"error": "Command 'explain' is only valid after a 'check' command"}
+        return {"explanation": exp_dict}
 
     def check(
         self, sources: list[BuildSource], export_types: bool, is_tty: bool, terminal_width: int
@@ -538,6 +579,21 @@ class Server:
         else:
             # Stores the initial state of sources as a side effect.
             self.fswatcher.find_changed()
+            initial_changed_paths = [
+                state.path
+                for state in self.fine_grained_manager.graph.values()
+                if state.path is not None
+            ]
+            initial_exp = UpdateExplanation(
+                update_id=1,
+                changed_files=initial_changed_paths,
+                removed_files=[],
+                is_initial=True,
+                duration_ms=0.0,
+            )
+            self.fine_grained_manager.update_count = 1
+            self.fine_grained_manager.last_explanation = initial_exp
+            self.last_explanation = initial_exp
 
         if MEM_PROFILE:
             from mypy.memprofile import print_memory_profile
@@ -660,13 +716,17 @@ class Server:
                 sources2, graph, seen, changed_paths
             )
             self.update_sources(new_files)
-            messages = fine_grained_manager.update(changed, [], followed=True)
+            messages = fine_grained_manager.update(
+                changed, [], followed=True, merge_with_previous=True
+            )
             worklist.extend(changed)
 
         t2 = time.time()
 
         def refresh_file(module: str, path: str) -> list[str]:
-            return fine_grained_manager.update([(module, path)], [], followed=True)
+            return fine_grained_manager.update(
+                [(module, path)], [], followed=True, merge_with_previous=True
+            )
 
         for module_id, state in list(graph.items()):
             new_messages = refresh_suppressed_submodules(
@@ -686,7 +746,9 @@ class Server:
             new_files = [BuildSource(mod[1], mod[0], followed=True) for mod in new_unsuppressed]
             sources.extend(new_files)
             self.update_sources(new_files)
-            messages = fine_grained_manager.update(new_unsuppressed, [], followed=True)
+            messages = fine_grained_manager.update(
+                new_unsuppressed, [], followed=True, merge_with_previous=True
+            )
 
             for module_id, path in new_unsuppressed:
                 new_messages = refresh_suppressed_submodules(
@@ -707,7 +769,7 @@ class Server:
                 assert module_path is not None
                 to_delete.append((module_id, module_path))
         if to_delete:
-            messages = fine_grained_manager.update([], to_delete)
+            messages = fine_grained_manager.update([], to_delete, merge_with_previous=True)
 
         fix_module_deps(graph)
 

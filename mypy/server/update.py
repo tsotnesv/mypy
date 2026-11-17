@@ -150,9 +150,18 @@ from mypy.nodes import (
 from mypy.options import Options
 from mypy.semanal_main import semantic_analysis_for_scc, semantic_analysis_for_targets
 from mypy.server.astdiff import (
+    SymbolDiff,
     SymbolSnapshot,
     compare_symbol_table_snapshots,
+    compare_symbol_table_snapshots_detailed,
     snapshot_symbol_table,
+)
+from mypy.server.explain import (
+    ExplanationRecorder,
+    InvalidationReason,
+    UpdateExplanation,
+    collect_func_bodies,
+    find_body_only_changes,
 )
 from mypy.server.astmerge import merge_asts
 from mypy.server.aststrip import strip_target
@@ -179,6 +188,7 @@ class FineGrainedBuildManager:
             graph: Additional state of the build (mutated by this class)
         """
         manager = result.manager
+
         self.manager = manager
         self.graph = result.graph
         self.previous_modules = get_module_to_path_map(self.graph)
@@ -204,12 +214,17 @@ class FineGrainedBuildManager:
         self.updated_modules: list[str] = []
         # Targets processed during last update (for testing only).
         self.processed_targets: list[str] = []
+        self.update_count: int = 0
+        self.last_explanation: UpdateExplanation | None = None
+        self._active_recorder: ExplanationRecorder | None = None
+        self._active_blocker: str | None = None
 
     def update(
         self,
         changed_modules: list[tuple[str, str]],
         removed_modules: list[tuple[str, str]],
         followed: bool = False,
+        merge_with_previous: bool = False,
     ) -> list[str]:
         """Update previous build result by processing changed modules.
 
@@ -226,83 +241,91 @@ class FineGrainedBuildManager:
             removed_modules: Modules that have been deleted since the previous update
                 or removed from the build.
             followed: If True, the modules were found through following imports
+            merge_with_previous: If True, merge recorded explanation into
+                self.last_explanation (used across multi-wave follow_imports updates).
 
         Returns:
             A list of errors.
         """
+
         self.processed_targets.clear()
         changed_modules = changed_modules + removed_modules
         removed_set = {module for module, _ in removed_modules}
         self.changed_modules = changed_modules
 
+        if not merge_with_previous:
+            self.update_count += 1
+        recorder = ExplanationRecorder(update_id=self.update_count, is_initial=False)
+
         if not changed_modules:
+            if self.last_explanation is None:
+                self.last_explanation = recorder.finalize(self.manager.modules)
             return self.previous_messages
 
-        # Reset find_module's caches for the new build.
-        self.manager.find_module_cache.clear()
+        self._active_recorder = recorder
+        self._active_blocker = None
+        try:
+            # Reset find_module's caches for the new build.
+            self.manager.find_module_cache.clear()
 
-        self.triggered = []
-        self.updated_modules = []
-        changed_modules = dedupe_modules(changed_modules + self.stale)
-        initial_set = {id for id, _ in changed_modules}
-        self.manager.log_fine_grained(
-            "==== update %s ====" % ", ".join(repr(id) for id, _ in changed_modules)
-        )
-        if self.previous_targets_with_errors and is_verbose(self.manager):
+            self.triggered = []
+            self.updated_modules = []
+            changed_modules = dedupe_modules(changed_modules + self.stale)
+            initial_set = {id for id, _ in changed_modules}
             self.manager.log_fine_grained(
-                "previous targets with errors: %s" % sorted(self.previous_targets_with_errors)
+                "==== update %s ====" % ", ".join(repr(id) for id, _ in changed_modules)
             )
-
-        blocking_error = None
-        if self.blocking_error:
-            # Handle blocking errors first. We'll exit as soon as we find a
-            # module that still has blocking errors.
-            self.manager.log_fine_grained(f"existing blocker: {self.blocking_error[0]}")
-            changed_modules = dedupe_modules([self.blocking_error] + changed_modules)
-            blocking_error = self.blocking_error[0]
-            self.blocking_error = None
-
-        while True:
-            result = self.update_one(
-                changed_modules, initial_set, removed_set, blocking_error, followed
-            )
-            changed_modules, (next_id, next_path), blocker_messages = result
-
-            if blocker_messages is not None:
-                self.blocking_error = (next_id, next_path)
-                self.stale = changed_modules
-                messages = blocker_messages
-                break
-
-            # It looks like we are done processing everything, so now
-            # reprocess all targets with errors. We are careful to
-            # support the possibility that reprocessing an errored module
-            # might trigger loading of a module, but I am not sure
-            # if this can really happen.
-            if not changed_modules:
-                # N.B: We just checked next_id, so manager.errors contains
-                # the errors from it. Thus we consider next_id up to date
-                # when propagating changes from the errored targets,
-                # which prevents us from reprocessing errors in it.
-                changed_modules = propagate_changes_using_dependencies(
-                    self.manager,
-                    self.graph,
-                    self.deps,
-                    set(),
-                    {next_id},
-                    self.previous_targets_with_errors,
-                    self.processed_targets,
+            if self.previous_targets_with_errors and is_verbose(self.manager):
+                self.manager.log_fine_grained(
+                    "previous targets with errors: %s" % sorted(self.previous_targets_with_errors)
                 )
-                changed_modules = dedupe_modules(changed_modules)
-                if not changed_modules:
-                    # Preserve state needed for the next update.
-                    self.previous_targets_with_errors = self.manager.errors.targets()
-                    messages = self.manager.errors.new_messages()
+
+            blocking_error = None
+            if self.blocking_error:
+                self.manager.log_fine_grained(f"existing blocker: {self.blocking_error[0]}")
+                changed_modules = dedupe_modules([self.blocking_error] + changed_modules)
+                blocking_error = self.blocking_error[0]
+                self._active_blocker = blocking_error
+                self.blocking_error = None
+
+            while True:
+                result = self.update_one(
+                    changed_modules, initial_set, removed_set, blocking_error, followed
+                )
+                changed_modules, (next_id, next_path), blocker_messages = result
+
+                if blocker_messages is not None:
+                    self.blocking_error = (next_id, next_path)
+                    self.stale = changed_modules
+                    messages = blocker_messages
                     break
 
-        messages = sort_messages_preserving_file_order(messages, self.previous_messages)
-        self.previous_messages = messages.copy()
-        return messages
+                if not changed_modules:
+                    changed_modules = propagate_changes_using_dependencies(
+                        self.manager,
+                        self.graph,
+                        self.deps,
+                        set(),
+                        {next_id},
+                        self.previous_targets_with_errors,
+                        self.processed_targets,
+                        recorder=recorder,
+                    )
+                    changed_modules = dedupe_modules(changed_modules)
+                    if not changed_modules:
+                        self.previous_targets_with_errors = self.manager.errors.targets()
+                        messages = self.manager.errors.new_messages()
+                        break
+
+            messages = sort_messages_preserving_file_order(messages, self.previous_messages)
+            self.previous_messages = messages.copy()
+            return messages
+        finally:
+            if merge_with_previous and self.last_explanation is not None:
+                recorder.merge_from(self.last_explanation)
+            self.last_explanation = recorder.finalize(self.manager.modules)
+            self._active_recorder = None
+            self._active_blocker = None
 
     def trigger(self, target: str) -> list[str]:
         """Trigger a specific target explicitly.
@@ -423,10 +446,34 @@ class FineGrainedBuildManager:
 
         t0 = time.time()
         # Record symbol table snapshot of old version the changed module.
+        old_tree = manager.modules.get(module)
+        old_bodies = collect_func_bodies(old_tree) if old_tree is not None else {}
         old_snapshots: dict[str, dict[str, SymbolSnapshot]] = {}
-        if module in manager.modules:
-            snapshot = snapshot_symbol_table(module, manager.modules[module].names)
+        if old_tree is not None:
+            snapshot = snapshot_symbol_table(module, old_tree.names)
             old_snapshots[module] = snapshot
+
+        if self._active_recorder is not None:
+            if force_removed or not manager.fscache.isfile(path):
+                if old_tree is not None:
+                    self._active_recorder.cache_locations_before_discard(
+                        [module], manager.modules
+                    )
+                self._active_recorder.record_file_change(
+                    module, path, InvalidationReason.FILE_DELETED
+                )
+            elif module == self._active_blocker:
+                self._active_recorder.record_file_change(
+                    module, path, InvalidationReason.BLOCKER_ERROR
+                )
+            elif module not in previous_modules:
+                self._active_recorder.record_file_change(
+                    module, path, InvalidationReason.FILE_ADDED
+                )
+            else:
+                self._active_recorder.record_file_change(
+                    module, path, InvalidationReason.FILE_MODIFIED
+                )
 
         manager.errors.reset()
         self.processed_targets.append(module)
@@ -436,6 +483,13 @@ class FineGrainedBuildManager:
         if isinstance(result, BlockedUpdate):
             # Blocking error -- just give up
             module, path, remaining, errors = result
+            if self._active_recorder is not None:
+                self._active_recorder.record_file_change(
+                    module,
+                    path,
+                    InvalidationReason.BLOCKER_ERROR,
+                    detail=errors[0] if errors else None,
+                )
             self.previous_modules = get_module_to_path_map(graph)
             return remaining, (module, path), errors
         assert isinstance(result, NormalUpdate)  # Work around #4124
@@ -443,7 +497,16 @@ class FineGrainedBuildManager:
 
         # TODO: What to do with stale dependencies?
         t1 = time.time()
-        triggered = calculate_active_triggers(manager, old_snapshots, {module: tree})
+        triggered = calculate_active_triggers(
+            manager, old_snapshots, {module: tree}, recorder=self._active_recorder
+        )
+        if self._active_recorder is not None and old_bodies and tree is not None:
+            sig_changed = {t.strip("<>").split("[", 1)[0] for t in triggered}
+            for body_target in find_body_only_changes(old_bodies, tree, sig_changed):
+                self._active_recorder.record_body_change(
+                    target=body_target,
+                    upstream_module=module,
+                )
         if is_verbose(self.manager):
             filtered = [trigger for trigger in triggered if not trigger.endswith("__>")]
             self.manager.log_fine_grained(f"triggered: {sorted(filtered)!r}")
@@ -459,6 +522,7 @@ class FineGrainedBuildManager:
             {module},
             targets_with_errors=set(),
             processed_targets=self.processed_targets,
+            recorder=self._active_recorder,
         )
         t2 = time.time()
         manager.add_stats(update_isolated_time=t1 - t0, propagate_time=t2 - t1)
@@ -764,12 +828,9 @@ def calculate_active_triggers(
     manager: BuildManager,
     old_snapshots: dict[str, dict[str, SymbolSnapshot]],
     new_modules: dict[str, MypyFile | None],
+    recorder: ExplanationRecorder | None = None,
 ) -> set[str]:
-    """Determine activated triggers by comparing old and new symbol tables.
-
-    For example, if only the signature of function m.f is different in the new
-    symbol table, return {'<m.f>'}.
-    """
+    """Determine activated triggers by comparing old and new symbol tables."""
     names: set[str] = set()
     for id in new_modules:
         snapshot1 = old_snapshots.get(id)
@@ -782,7 +843,18 @@ def calculate_active_triggers(
             names.add(id)
         else:
             snapshot2 = snapshot_symbol_table(id, new.names)
-        diff = compare_symbol_table_snapshots(id, snapshot1, snapshot2)
+        if recorder is not None:
+            diff, diffs = compare_symbol_table_snapshots_detailed(id, snapshot1, snapshot2)
+            for d in diffs:
+                recorder.record_symbol_diff(
+                    target=d.target,
+                    trigger=make_trigger(d.name),
+                    detail=d.detail,
+                    upstream_module=id,
+                    is_mro=d.is_mro,
+                )
+        else:
+            diff = compare_symbol_table_snapshots(id, snapshot1, snapshot2)
         diff |= wildcard_triggers_for_changes(id, diff)
         names |= diff
     return {make_trigger(name) for name in names}
@@ -846,33 +918,29 @@ def propagate_changes_using_dependencies(
     up_to_date_modules: set[str],
     targets_with_errors: set[str],
     processed_targets: list[str],
+    recorder: ExplanationRecorder | None = None,
 ) -> list[tuple[str, str]]:
-    """Transitively rechecks targets based on triggers and the dependency map.
-
-    Returns a list (module id, path) tuples representing modules that contain
-    a target that needs to be reprocessed but that has not been parsed yet.
-
-    Processed targets should be appended to processed_targets (used in tests only,
-    to test the order of processing targets).
-    """
-
     num_iter = 0
     remaining_modules: list[tuple[str, str]] = []
 
-    # Propagate changes until nothing visible has changed during the last
-    # iteration.
     while triggered or targets_with_errors:
         num_iter += 1
         if num_iter > MAX_ITER:
             raise RuntimeError("Max number of iterations (%d) reached (endless loop?)" % MAX_ITER)
 
+        if recorder is not None:
+            for trigger in sorted(triggered):
+                for dep_target in sorted(deps.get(trigger, set())):
+                    if dep_target.startswith("<"):
+                        continue
+                    dep_mod = module_prefix(graph, dep_target)
+                    if dep_mod is not None and dep_mod not in up_to_date_modules:
+                        recorder.record_trigger_propagation(trigger, dep_target)
+
         todo, unloaded, stale_protos = find_targets_recursive(
             manager, graph, triggered, deps, up_to_date_modules
         )
-        # TODO: we sort to make it deterministic, but this is *incredibly* ad hoc
         remaining_modules.extend((id, graph[id].xpath) for id in sorted(unloaded))
-        # Also process targets that used to have errors, as otherwise some
-        # errors might be lost.
         for target in targets_with_errors:
             id = module_prefix(graph, target)
             if id is not None and id not in up_to_date_modules:
@@ -882,20 +950,14 @@ def propagate_changes_using_dependencies(
                 more_nodes, _ = lookup_target(manager, target, id)
                 todo[id].update(more_nodes)
         triggered = set()
-        # First invalidate subtype caches in all stale protocols.
-        # We need to do this to avoid false negatives if the protocol itself is
-        # unchanged, but was marked stale because its sub- (or super-) type changed.
         for info in stale_protos:
             type_state.reset_subtype_caches_for(info)
         type_state.bind_self_cache.clear()
-        # Then fully reprocess all targets.
-        # TODO: Preserve order (set is not optimal)
         for id, nodes in sorted(todo.items(), key=lambda x: x[0]):
             assert id not in up_to_date_modules
-            triggered |= reprocess_nodes(manager, graph, id, nodes, deps, processed_targets)
-        # Changes elsewhere may require us to reprocess modules that were
-        # previously considered up to date. For example, there may be a
-        # dependency loop that loops back to an originally processed module.
+            triggered |= reprocess_nodes(
+                manager, graph, id, nodes, deps, processed_targets, recorder=recorder
+            )
         up_to_date_modules = set()
         targets_with_errors = set()
         if is_verbose(manager):
@@ -966,6 +1028,22 @@ def find_targets_recursive(
     return result, unloaded_files, stale_protos
 
 
+def _match_origin_target(
+    changed_qualname: str, candidate_targets: list[str], fallback_module: str
+) -> str:
+    for t in candidate_targets:
+        if changed_qualname == t or changed_qualname.startswith(f"{t}."):
+            return t
+    if "." in changed_qualname:
+        enclosing = changed_qualname.rsplit(".", 1)[0]
+        for t in candidate_targets:
+            if "." in t and t.rsplit(".", 1)[0] == enclosing:
+                return t
+    if len(candidate_targets) == 1:
+        return candidate_targets[0]
+    return fallback_module
+
+
 def reprocess_nodes(
     manager: BuildManager,
     graph: dict[str, State],
@@ -973,6 +1051,7 @@ def reprocess_nodes(
     nodeset: set[FineGrainedDeferredNode],
     deps: dict[str, set[str]],
     processed_targets: list[str],
+    recorder: ExplanationRecorder | None = None,
 ) -> set[str]:
     """Reprocess a set of nodes within a single module.
 
@@ -1048,11 +1127,37 @@ def reprocess_nodes(
 
     new_symbols_snapshot = snapshot_symbol_table(file_node.fullname, file_node.names)
     # Check if any attribute types were changed and need to be propagated further.
-    changed = compare_symbol_table_snapshots(
-        file_node.fullname, old_symbols_snapshot, new_symbols_snapshot
-    )
-    changed |= wildcard_triggers_for_changes(module_id, changed)
-    new_triggered = {make_trigger(name) for name in changed}
+    if recorder is not None:
+        changed, diffs = compare_symbol_table_snapshots_detailed(
+            file_node.fullname, old_symbols_snapshot, new_symbols_snapshot
+        )
+        changed |= wildcard_triggers_for_changes(module_id, changed)
+        new_triggered = {make_trigger(name) for name in changed}
+
+        sorted_targets = sorted(targets)
+        for diff in diffs:
+            trig = make_trigger(diff.name)
+            origin = _match_origin_target(diff.target, sorted_targets, module_id)
+            recorder.record_symbol_diff(
+                target=diff.target,
+                trigger=trig,
+                detail=diff.detail,
+                upstream_module=origin,
+                is_mro=diff.is_mro,
+            )
+            recorder.register_trigger_origin(trig, origin)
+
+        for trig in new_triggered:
+            if trig not in recorder.trigger_origins:
+                stripped = trig.strip("<>").split("[", 1)[0]
+                origin = _match_origin_target(stripped, sorted_targets, module_id)
+                recorder.register_trigger_origin(trig, origin)
+    else:
+        changed = compare_symbol_table_snapshots(
+            file_node.fullname, old_symbols_snapshot, new_symbols_snapshot
+        )
+        changed |= wildcard_triggers_for_changes(module_id, changed)
+        new_triggered = {make_trigger(name) for name in changed}
 
     # Dependencies may have changed.
     update_deps(module_id, nodes, graph, deps, options)

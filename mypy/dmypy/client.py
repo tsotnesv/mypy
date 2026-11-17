@@ -24,6 +24,7 @@ from mypy.dmypy_util import DEFAULT_STATUS_FILE, receive, send
 from mypy.ipc import BadStatus, IPCClient, IPCException, read_status
 from mypy.util import check_python_version, get_terminal_width, should_force_color
 from mypy.version import __version__
+from mypy.server.explain import UpdateExplanation, render_reverse, render_tree
 
 # Argument parser.  Subparsers are tied to action functions by the
 # @action(subparse) decorator.
@@ -92,6 +93,45 @@ p.add_argument(
     help="Store types of all expressions in a shared location (useful for inspections)",
 )
 
+p.add_argument(
+    "--explain",
+    action="store_true",
+    help="Explain why modules, functions, and methods were rechecked",
+)
+p.add_argument(
+    "--explain-target",
+    metavar="TARGET",
+    default=None,
+    help="Filter invalidation explanation to a specific module, class, function, or method",
+)
+
+explain_parser = p = subparsers.add_parser(
+    "explain", help="Show invalidation explanation from the last incremental update"
+)
+p.add_argument(
+    "--target",
+    metavar="TARGET",
+    default=None,
+    help="Reverse causal query: trace why a specific module, class, function, or method was rechecked",
+)
+p.add_argument(
+    "--reverse",
+    action="store_true",
+    help="Render causal chain bottom-up from the queried target to root file edits",
+)
+p.add_argument(
+    "--format",
+    choices=["tree", "json"],
+    default="tree",
+    help="Output format (default: tree)",
+)
+p.add_argument(
+    "--depth",
+    type=int,
+    default=None,
+    help="Maximum causal chain depth to display",
+)
+
 run_parser = p = subparsers.add_parser(
     "run",
     formatter_class=AugmentedHelpFormatter,
@@ -122,6 +162,7 @@ recheck_parser = p = subparsers.add_parser(
     formatter_class=AugmentedHelpFormatter,
     help="Re-check the previous list of files, with optional modifications (requires daemon)",
 )
+
 p.add_argument("-v", "--verbose", action="store_true", help="Print detailed status")
 p.add_argument("-q", "--quiet", action="store_true", help=argparse.SUPPRESS)  # Deprecated
 p.add_argument("--junit-xml", help="Write junit.xml to the given file")
@@ -138,6 +179,18 @@ p.add_argument(
     help="Files in the run to add or check again (default: all from previous run)",
 )
 p.add_argument("--remove", metavar="FILE", nargs="*", help="Files to remove from the run")
+
+p.add_argument(
+    "--explain",
+    action="store_true",
+    help="Explain why modules, functions, and methods were rechecked",
+)
+p.add_argument(
+    "--explain-target",
+    metavar="TARGET",
+    default=None,
+    help="Filter invalidation explanation to a specific module, class, function, or method",
+)
 
 suggest_parser = p = subparsers.add_parser(
     "suggest", help="Suggest a signature or show call sites for a specific function"
@@ -460,48 +513,6 @@ def do_kill(args: argparse.Namespace) -> None:
     else:
         print("Daemon killed")
 
-
-@action(check_parser)
-def do_check(args: argparse.Namespace) -> None:
-    """Ask the daemon to check a list of files."""
-    t0 = time.time()
-    response = request(args.status_file, "check", files=args.files, export_types=args.export_types)
-    t1 = time.time()
-    response["roundtrip_time"] = t1 - t0
-    check_output(response, args.verbose, args.junit_xml, args.perf_stats_file)
-
-
-@action(recheck_parser)
-def do_recheck(args: argparse.Namespace) -> None:
-    """Ask the daemon to recheck the previous list of files, with optional modifications.
-
-    If at least one of --remove or --update is given, the server will
-    update the list of files to check accordingly and assume that any other files
-    are unchanged.  If none of these flags are given, the server will call stat()
-    on each file last checked to determine its status.
-
-    Files given in --update ought to exist.  Files given in --remove need not exist;
-    if they don't they will be ignored.
-    The lists may be empty but oughtn't contain duplicates or overlap.
-
-    NOTE: The list of files is lost when the daemon is restarted.
-    """
-    t0 = time.time()
-    if args.remove is not None or args.update is not None:
-        response = request(
-            args.status_file,
-            "recheck",
-            export_types=args.export_types,
-            remove=args.remove,
-            update=args.update,
-        )
-    else:
-        response = request(args.status_file, "recheck", export_types=args.export_types)
-    t1 = time.time()
-    response["roundtrip_time"] = t1 - t0
-    check_output(response, args.verbose, args.junit_xml, args.perf_stats_file)
-
-
 @action(suggest_parser)
 def do_suggest(args: argparse.Namespace) -> None:
     """Ask the daemon for a suggested signature.
@@ -542,6 +553,66 @@ def do_inspect(args: argparse.Namespace) -> None:
     )
     check_output(response, verbose=False, junit_xml=None, perf_stats_file=None)
 
+@action(check_parser)
+def do_check(args: argparse.Namespace) -> None:
+    """Ask the daemon to check a list of files."""
+    t0 = time.time()
+    response = request(
+        args.status_file,
+        "check",
+        files=args.files,
+        export_types=args.export_types,
+        explain=args.explain,
+        explain_target=args.explain_target,
+    )
+    t1 = time.time()
+    response["roundtrip_time"] = t1 - t0
+    check_output(response, args.verbose, args.junit_xml, args.perf_stats_file)
+
+
+@action(recheck_parser)
+def do_recheck(args: argparse.Namespace) -> None:
+    t0 = time.time()
+    if args.remove is not None or args.update is not None:
+        response = request(
+            args.status_file,
+            "recheck",
+            export_types=args.export_types,
+            remove=args.remove,
+            update=args.update,
+            explain=args.explain,
+            explain_target=args.explain_target,
+        )
+    else:
+        response = request(
+            args.status_file,
+            "recheck",
+            export_types=args.export_types,
+            explain=args.explain,
+            explain_target=args.explain_target,
+        )
+    t1 = time.time()
+    response["roundtrip_time"] = t1 - t0
+    check_output(response, args.verbose, args.junit_xml, args.perf_stats_file)
+
+
+@action(explain_parser)
+def do_explain(args: argparse.Namespace) -> None:
+    """Ask daemon to explain the most recent incremental update."""
+    response = request(args.status_file, "explain", target=args.target)
+    if "error" in response:
+        fail(response["error"])
+    raw = response.get("explanation")
+    if not isinstance(raw, dict):
+        fail("Invalid explanation payload returned by daemon.")
+    if args.format == "json":
+        print(json.dumps(raw, indent=2))
+        return
+    explanation = UpdateExplanation.from_dict(raw)
+    if args.reverse:
+        print(render_reverse(explanation, max_depth=args.depth))
+    else:
+        print(render_tree(explanation, max_depth=args.depth))
 
 def check_output(
     response: dict[str, Any], verbose: bool, junit_xml: str | None, perf_stats_file: str | None
@@ -583,6 +654,13 @@ def check_output(
         telemetry = response.get("stats", {})
         with open(perf_stats_file, "w") as f:
             json.dump(telemetry, f)
+
+    raw_explanation = response.get("explanation")
+    if isinstance(raw_explanation, dict):
+        explanation = UpdateExplanation.from_dict(raw_explanation)
+        print()
+        print(render_tree(explanation))
+
 
     if status_code:
         sys.exit(status_code)

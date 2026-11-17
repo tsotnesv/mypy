@@ -1,0 +1,2 @@
+TokenId = int
+# TokenId = bytes

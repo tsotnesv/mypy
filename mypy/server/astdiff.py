@@ -53,6 +53,7 @@ Summary of how this works for certain kinds of differences:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TypeAlias as _TypeAlias, Union
 
 from mypy.expandtype import expand_type
@@ -103,6 +104,133 @@ from mypy.types import (
     UnpackType,
 )
 from mypy.util import get_prefix
+
+
+@dataclass(frozen=True)
+class SymbolDiff:
+    name: str
+    target: str
+    detail: str
+    is_mro: bool = False
+
+
+def _format_type_snapshot(snap: object) -> str:
+    if not isinstance(snap, tuple) or not snap:
+        return str(snap)
+    tag = snap[0]
+    if tag == "<not set>":
+        return "unannotated"
+    if tag == "NoneType":
+        return "None"
+    if tag == "AnyType":
+        return "Any"
+    if tag == "Instance" and len(snap) >= 3:
+        fullname = str(snap[1])
+        args = snap[2]
+        if isinstance(args, tuple) and args:
+            formatted_args = ", ".join(_format_type_snapshot(a) for a in args)
+            return f"{fullname}[{formatted_args}]"
+        return fullname
+    if tag == "TupleType" and len(snap) >= 2 and isinstance(snap[1], tuple):
+        items = ", ".join(_format_type_snapshot(a) for a in snap[1])
+        return f"tuple[{items}]"
+    if tag == "LiteralType" and len(snap) >= 3:
+        return f"Literal[{snap[2]!r}]"
+    if tag == "UnionType" and len(snap) >= 2 and isinstance(snap[1], tuple):
+        return " | ".join(_format_type_snapshot(a) for a in snap[1])
+    if tag == "CallableType" and len(snap) >= 3:
+        arg_snaps = snap[1] if isinstance(snap[1], tuple) else ()
+        args_str = ", ".join(_format_type_snapshot(a) for a in arg_snaps)
+        return f"({args_str}) -> {_format_type_snapshot(snap[2])}"
+    return str(tag)
+
+
+def compare_symbol_table_snapshots_detailed(
+    name_prefix: str,
+    snapshot1: dict[str, SymbolSnapshot],
+    snapshot2: dict[str, SymbolSnapshot],
+) -> tuple[set[str], list[SymbolDiff]]:
+    triggers = compare_symbol_table_snapshots(name_prefix, snapshot1, snapshot2)
+    diffs: list[SymbolDiff] = []
+
+    for name in sorted(snapshot1.keys() - snapshot2.keys()):
+        item_name = f"{name_prefix}.{name}"
+        diffs.append(SymbolDiff(name=item_name, target=item_name, detail="symbol removed"))
+
+    for name in sorted(snapshot2.keys() - snapshot1.keys()):
+        item_name = f"{name_prefix}.{name}"
+        diffs.append(SymbolDiff(name=item_name, target=item_name, detail="symbol added"))
+
+    for name in sorted(set(snapshot1.keys()) & set(snapshot2.keys())):
+        item1 = snapshot1[name]
+        item2 = snapshot2[name]
+        if item1 == item2:
+            continue
+        item_name = f"{name_prefix}.{name}"
+        kind1 = item1[0]
+        kind2 = item2[0]
+
+        if kind1 != kind2:
+            diffs.append(
+                SymbolDiff(
+                    name=item_name,
+                    target=item_name,
+                    detail=f"symbol kind changed ({kind1} -> {kind2})",
+                )
+            )
+        elif kind1 == "TypeInfo":
+            if item1[:-1] != item2[:-1]:
+                raw_attrs1 = item1[2]
+                raw_attrs2 = item2[2]
+                attrs1 = list(raw_attrs1) if isinstance(raw_attrs1, (list, tuple)) else []
+                attrs2 = list(raw_attrs2) if isinstance(raw_attrs2, (list, tuple)) else []
+                is_mro = len(attrs1) > 10 and len(attrs2) > 10 and attrs1[10] != attrs2[10]
+                detail = (
+                    f"class MRO changed ({attrs1[10]} -> {attrs2[10]})"
+                    if is_mro
+                    else "class definition changed"
+                )
+                diffs.append(
+                    SymbolDiff(name=item_name, target=item_name, detail=detail, is_mro=is_mro)
+                )
+            assert isinstance(item1[-1], dict)
+            assert isinstance(item2[-1], dict)
+            _, nested_diffs = compare_symbol_table_snapshots_detailed(
+                item_name, item1[-1], item2[-1]
+            )
+            diffs.extend(nested_diffs)
+        elif kind1 == "Var" and len(item1) >= 3 and len(item2) >= 3:
+            old_t = _format_type_snapshot(item1[2])
+            new_t = _format_type_snapshot(item2[2])
+            diffs.append(
+                SymbolDiff(
+                    name=item_name,
+                    target=item_name,
+                    detail=f"type changed ({old_t} -> {new_t})",
+                )
+            )
+        elif kind1 == "Func" and len(item1) >= 7 and len(item2) >= 7:
+            old_sig = _format_type_snapshot(item1[6])
+            new_sig = _format_type_snapshot(item2[6])
+            diffs.append(
+                SymbolDiff(
+                    name=item_name,
+                    target=item_name,
+                    detail=f"signature changed ({old_sig} -> {new_sig})",
+                )
+            )
+        else:
+            target = name_prefix if name == "(abstract)" else item_name
+            diffs.append(
+                SymbolDiff(
+                    name=item_name,
+                    target=target,
+                    detail=f"{kind1} definition changed",
+                )
+            )
+
+    return triggers, diffs
+
 
 # Snapshot representation of a symbol table node or type. The representation is
 # opaque -- the only supported operations are comparing for equality and
