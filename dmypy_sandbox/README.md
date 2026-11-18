@@ -14,7 +14,18 @@ Until now, those decisions happened silently. **`dmypy explain`** makes the daem
 
 ## Running Your Fork (`python -m mypy.dmypy`)
 
-If a system-wide `mypy` is installed on your `PATH`, running bare `dmypy` will invoke the upstream binary rather than your local checkout. Prefix commands with `python -m mypy.dmypy` from your repository environment (or define a temporary alias in your terminal before starting a demo):
+If a system-wide `mypy` is installed on your `PATH`, running bare `dmypy` will invoke the upstream binary rather than your local checkout. Create a virtual environment and install the fork in editable mode so `dmypy` and `python -m mypy.dmypy` resolve to this repository from any subdirectory:
+
+```bash
+unset PYTHONPATH
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+Prefix commands with `python -m mypy.dmypy` from your repository environment (or define a temporary alias in your terminal before starting a demo):
+
+
 
 ```bash
 # Optional shorthand for your current shell session:
